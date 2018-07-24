@@ -5,13 +5,25 @@ from PIL import Image
 from torchvision import transforms
 import torch
 from nltk import word_tokenize
+import pickle
+
+def is_number(s):
+    """Returns True if the string s is any kind of number (includes decimals)."""
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
 
 def tokenize(caption):
     """
     Returns a list of words (tokens) in the given caption.
     """
     caption = caption.lower()
-    tokens = word_tokenize(caption)
+    tokens = ['<start>'] + word_tokenize(caption) + ['<end>']
+    for i in range(len(tokens)):
+        if is_number(tokens[i]):
+            tokens[i] = '<num>' # replaces all numbers with number token
     return tokens
 
 dataDir = '..'
@@ -49,4 +61,9 @@ for i in range(len(images)):
 
 # store image data
 torch.save(img_data, 'img_data.pt')
+
+# store captions
+save_captions = open('captions.pickle', 'wb')
+pickle.dump(captions, save_captions)
+save_captions.close()
 
