@@ -61,7 +61,6 @@ class Captioner(torch.nn.Module):
         super(Captioner, self).__init__()
 
         vgg = models.vgg16_bn(pretrained=True)
-        vgg.eval()
         newClassifier = torch.nn.Sequential(*list(vgg.classifier.children())[:-1]) # remove last FC layer
         vgg.classifier = newClassifier
 
@@ -85,7 +84,7 @@ class Captioner(torch.nn.Module):
             y_pred - tensor with sequence of probability distributions representing word predictions
         """
 
-        h_0 = self.linear1(self.vgg(x1)).unsqueeze(0)
+        h_0 = self.linear1(self.vgg(x1)).unsqueeze(0) # image representation passed to LSTM as initial hidden state
         c_0 = torch.zeros(h_0.size(), device=device, dtype=dtype)
 
         if training:
@@ -95,8 +94,9 @@ class Captioner(torch.nn.Module):
 
         else:
             # feed predicted words back into LSTM until end token is reached
-            continue
+            pass
 
+# load images and captions
 imgData = torch.load('img_data.pt')
 captions_f = open('captions.pickle', 'rb')
 captions = pickle.load(captions_f)
@@ -105,9 +105,9 @@ captions_f.close()
 (vocabSize, vocabEncoding) = create_encoding(captions)
 
 model = Captioner(vocabSize)
-new_params = []
-for p in model.parameters(): # removes CNN parameters from model's parameters
-    if p.requires_grad:
+new_params = [] # parameters to be updated
+for p in model.parameters():
+    if p.requires_grad: # excludes CNN parameters
         new_params.append(p)
 
 loss_fn = torch.nn.CrossEntropyLoss()
