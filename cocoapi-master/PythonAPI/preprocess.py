@@ -88,7 +88,12 @@ def create_encoding(captions):
                 else:
                     wordCounts[word] = 1
 
-    vocab = list(wordCounts.keys())
+    vocab = []
+    for word, count in wordCounts.items():
+        if count >= 5:
+            vocab.append(word)
+    vocab.append('<unk>') # add unknown token
+
     vocabEncoding = {}  # map each word to an integer
     for i in range(len(vocab)):
         vocabEncoding[vocab[i]] = i
