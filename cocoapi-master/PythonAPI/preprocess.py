@@ -40,13 +40,17 @@ def get_images(dataDir, dataType):
 
 def get_image_data(dataDir, dataType, images):
     """
-    Returns tensor filled with the data from images, which are first resized and cropped.
+    Returns tensor filled with the data from images, which are first resized, cropped, and normalized.
     """
+
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
     process = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize(224),
         transforms.CenterCrop(224),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        normalize
     ])
 
     imgData = torch.zeros(len(images), 3, 224, 224, device=device, dtype=dtype)
