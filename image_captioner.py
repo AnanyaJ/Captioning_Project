@@ -1,6 +1,9 @@
 import torch
 from torchvision import models
-import pickle
+import random
+import sys
+sys.path.insert(0, 'cocoapi-master/PythonAPI/')
+from preprocess import get_images, get_image_data, get_captions, create_encoding
 
 if torch.cuda.is_available():
     device = torch.device("cuda:0")
@@ -8,57 +11,90 @@ else:
     device = torch.device("cpu")
 dtype = torch.float
 
-def create_encoding(captions):
+def shuffle(images, captions):
     """
-    Maps each word present in captions to an integer. Returns the vocabulary size and this mapping.
+    Randomly shuffles items in captions and reorders images according to new caption order.
+
+    Returns new list of images and captions.
     """
-    wordCounts = {}
-    for imgCaps in captions:
-        for cap in imgCaps:
-            for word in cap:
-                if word in wordCounts:
-                    wordCounts[word] += 1
-                else:
-                    wordCounts[word] = 1
 
-    vocab = list(wordCounts.keys())
-    vocabEncoding = {}  # map each word to an integer
-    for i in range(len(vocab)):
-        vocabEncoding[vocab[i]] = i
+    for i in range(len(captions)): # keep track of which image index each caption corresponds to
+        captions[i] = (captions[i], i)
 
-    return len(vocab), vocabEncoding
+    random.shuffle(captions)
+    imagesOrdered = []
 
-def get_onehot(caption, vocabSize, vocabEncoding):
+    for i in range(len(captions)):
+        imagesOrdered.append(images[captions[i][1]]) # re-order images to match new caption order
+        captions[i] = captions[i][0]
+
+    return (imagesOrdered, captions)
+
+def sort_descending_length(images, captions):
     """
-    Creates and returns tensors representing caption by using vocabEncoding.
+    Sorts captions by decreasing length (number of words) and reorders images according to new caption order.
+
+    Returns new tensor with image data along with list of sorted captions.
+    """
+
+    for i in range(len(captions)): # keep track of which image index each caption corresponds to
+        captions[i].append(i)
+
+    captions.sort(reverse=True, key=len) # sort captions by length (descending)
+    imagesOrdered = torch.zeros(images.size(), device=device, dtype=dtype)
+
+    for i in range(len(captions)):
+        imagesOrdered[i] = images[captions[i][-1]] # re-order images to match new caption order
+        captions[i] = captions[i][:-1]
+
+    return (imagesOrdered, captions)
+
+def encode(captions, vocabSize, vocabEncoding):
+    """
+    Converts captions into tensors based on vocabEncoding.
 
     Arguments:
-        caption - a list of tokens (words) in an image caption
-        vocabSize - number of words in the vocabulary
+        captions - list of list of words, sorted by decreasing length
+        vocabSize - number of words in vocabulary
         vocabEncoding - mapping from words in vocabulary to integers
     Returns:
-        capOneHot - a tensor of one-hot vectors, one for each token in caption, based on vocabEncoding
-        capEncoded - a tensor of integers, one integer per token, based on vocabEncoding
+        onehot - PackedSequence object with captions, whose words are represented by one-hot vectors (excludes end tokens)
+        encoded - tensor with caption words represented by integers (excludes start tokens), padded to shape (num_captions, max_caption_length)
     """
-    capOneHot = torch.zeros(len(caption), vocabSize, device=device, dtype=dtype)
-    capEncoded = torch.zeros(len(caption), device=device, dtype=dtype)
 
-    for w in range(len(caption)):
-        capOneHot[w][vocabEncoding[caption[w]]] = 1
-        capEncoded[w] = vocabEncoding[caption[w]]
+    onehot = torch.zeros(len(captions), len(captions[0]), vocabSize, device=device, dtype=dtype)
+    encoded = torch.zeros(len(captions), len(captions[0]), device=device, dtype=dtype)
+    lengths = []
 
-    return (capOneHot, capEncoded)
+    for i in range(len(captions)):
+        caption = captions[i]
+        lengths.append(len(caption)-1)
+        for w in range(lengths[i]):
+            if caption[w] in vocabEncoding:
+                onehot[i][w][vocabEncoding[caption[w]]] = 1
+                encoded[i][w] = vocabEncoding[caption[w]]
+            else: # unknown word (appears less than 5 times in training data)
+                onehot[i][w][vocabEncoding['<unk>']] = 1
+                encoded[i][w] = vocabEncoding['<unk>']
+
+    onehot = torch.nn.utils.rnn.pack_padded_sequence(onehot[:, :-1, :], lengths, batch_first=True)
+
+    return (onehot, encoded[:, 1:].long())
 
 class Captioner(torch.nn.Module):
 
-    def __init__(self, vocabSize):
+    def __init__(self, vocabSize, endTokenIndex):
         """
         Model for image caption generation with a CNN encoder to understand the image followed by an LSTM decoder to produce a corresponding caption.
 
         Arguments:
             vocabSize - the number of words in the vocabulary
+            endTokenIndex - the integer that the end token was mapped to
         """
         super(Captioner, self).__init__()
+
+        self.endToken = endTokenIndex
+        self.vocabSize = vocabSize
 
         vgg = models.vgg16_bn(pretrained=True)
         newClassifier = torch.nn.Sequential(*list(vgg.classifier.children())[:-1]) # remove last FC layer
@@ -69,66 +105,86 @@ class Captioner(torch.nn.Module):
 
         self.vgg = vgg
         self.linear1 = torch.nn.Linear(4096, 512) # new last layer of CNN
-        self.lstm = torch.nn.LSTM(vocabSize, 512, batch_first=True)
-        self.linear2 = torch.nn.Linear(512, vocabSize)
+        self.lstm = torch.nn.LSTM(self.vocabSize, 512, batch_first=True)
+        self.linear2 = torch.nn.Linear(512, self.vocabSize)
 
-    def forward(self, x1, x2, training=True):
+    def forward(self, x1, x2):
         """
         Implements the forward pass of the caption generator.
 
         Arguments:
             x1 - tensor representing image
-            x2 - tensor representing sequence of words in caption
-            training - boolean revealing whether this forward pass is for the purpose of training (if True) or testing
+            x2 - tensor representing sequence of words in caption, of shape (batch_size, seq_length, num_classes)
         Returns:
-            y_pred - tensor with sequence of probability distributions representing word predictions
+            y_pred - (if training) tensor with sequence of probability distributions representing word predictions
+                     (otherwise) list of integers corresponding to predicted words
         """
 
         h_0 = self.linear1(self.vgg(x1)).unsqueeze(0) # image representation passed to LSTM as initial hidden state
         c_0 = torch.zeros(h_0.size(), device=device, dtype=dtype)
 
-        if training:
-            y_pred = self.linear2(self.lstm(x2, (h_0, c_0))[0])
+        if self.training:
+            y_pred = self.linear2(torch.nn.utils.rnn.pad_packed_sequence(self.lstm(x2, (h_0, c_0))[0], batch_first=True)[0])
 
             return torch.transpose(y_pred, 1, 2)
 
-        else:
-            # feed predicted words back into LSTM until end token is reached
+        else: # generate caption by sampling (feed generated words back into LSTM until end token reached)
             pass
 
-# load images and captions
-imgData = torch.load('img_data.pt')
-captions_f = open('captions.pickle', 'rb')
-captions = pickle.load(captions_f)
-captions_f.close()
+dataType = 'train2014'
 
-(vocabSize, vocabEncoding) = create_encoding(captions)
+# retrieve images
+images = get_images('cocoapi-master', dataType)
+print('%d Images Loaded.' % len(images))
 
-model = Captioner(vocabSize)
+# retrieve captions
+captions = get_captions('cocoapi-master', dataType, images)
+(vocab, vocabEncoding) = create_encoding(captions)
+vocabSize = len(vocab)
+
+model = Captioner(vocabSize, vocabEncoding['<end>'])
+if torch.cuda.is_available():
+    model = model.cuda()
+
 new_params = [] # parameters to be updated
 for p in model.parameters():
     if p.requires_grad: # excludes CNN parameters
         new_params.append(p)
 
-loss_fn = torch.nn.CrossEntropyLoss()
 learningRate = 1e-4
+numIters = 10
+numBatches = 300
+batchSize = len(images)//numBatches
+
+loss_fn = torch.nn.CrossEntropyLoss(size_average=False)
 optimizer = torch.optim.SGD(new_params, lr=learningRate)
+model.train()
 
-for i in range(len(captions)):
-    x1 = imgData[i].unsqueeze(0) # input to CNN (image)
-    (x2, y) = get_onehot(captions[i][0], vocabSize, vocabEncoding) # use first caption for image
-    x2 = x2[:-1].unsqueeze(0) # input to LSTM (caption)
-    y = y[1:].unsqueeze(0).long()
+for t in range(numIters):
+    (images, captions) = shuffle(images, captions)
 
-    # forward pass
-    y_pred = model(x1, x2)
-    loss = loss_fn(y_pred, y)
+    for b in range(numBatches):
 
-    # backward pass (update parameters after every training example)
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+        batchImages = get_image_data('..', dataType, images[b*batchSize:(b+1)*batchSize])
 
+        batchCaptions = captions[b*batchSize:(b+1)*batchSize]
+        for i in range(len(batchCaptions)):
+            batchCaptions[i] = random.choice(batchCaptions[i]) # randomly choose one caption for each image
 
+        (x1, batchCaptions) = sort_descending_length(batchImages, batchCaptions)
+
+        (x2, y) = encode(batchCaptions, vocabSize, vocabEncoding)
+
+        y_pred = model(x1, x2)
+        loss = loss_fn(y_pred, y)
+
+        print("(Epoch %s, Batch %s) Loss: %s" % (t + 1, b + 1, loss.item()))
+
+        # backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+model.eval()
 
 
