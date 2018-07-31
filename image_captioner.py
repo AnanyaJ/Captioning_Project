@@ -237,6 +237,7 @@ numIters = 10
 numBatches = 300
 batchSize = len(images)//numBatches
 valBatchSize = batchSize*len(valImages)//len(images)
+computeValLoss = False
 
 loss_fn = torch.nn.CrossEntropyLoss(size_average=False)
 optimizer = torch.optim.SGD(new_params, lr=learningRate)
@@ -262,14 +263,15 @@ for t in range(numIters):
         loss.backward()
         optimizer.step()
 
-        # valBatchImages = get_image_data('..', valDataType, valImages[b*valBatchSize:(b+1)*valBatchSize])
-        # valBatchCaptions = valCaptions[b*valBatchSize:(b+1)*valBatchSize]
-        # (x1_val, x2_val, y_val) = prepare_data(valBatchImages, valBatchCaptions, vocabSize, vocabEncoding)
-        #
-        # y_pred_val = model(x1_val, x2_val)
-        # loss_val = loss_fn(y_pred_val, y_val)
-        #
-        # print("(Epoch %d, Batch %d) Validation Loss: %f" % (t + 1, b + 1, loss_val.item()))
+        if computeValLoss:
+            valBatchImages = get_image_data('..', valDataType, valImages[b*valBatchSize:(b+1)*valBatchSize])
+            valBatchCaptions = valCaptions[b*valBatchSize:(b+1)*valBatchSize]
+            (x1_val, x2_val, y_val) = prepare_data(valBatchImages, valBatchCaptions, vocabSize, vocabEncoding)
+
+            y_pred_val = model(x1_val, x2_val)
+            loss_val = loss_fn(y_pred_val, y_val)
+
+            print("(Epoch %d, Batch %d) Validation Loss: %f" % (t + 1, b + 1, loss_val.item()))
 
     evaluate(valImages, valCaptions, model, valDataType, vocab)
 
