@@ -38,17 +38,18 @@ def sort_descending_length(images, captions):
     Returns new tensor with image data along with list of sorted captions.
     """
 
+    capsOrdered = []
     for i in range(len(captions)): # keep track of which image index each caption corresponds to
-        captions[i].append(i)
+        capsOrdered.append(captions[i] + [i])
 
-    captions.sort(reverse=True, key=len) # sort captions by length (descending)
+    capsOrdered.sort(reverse=True, key=len) # sort captions by length (descending)
     imagesOrdered = torch.zeros(images.size(), device=device, dtype=dtype)
 
-    for i in range(len(captions)):
-        imagesOrdered[i] = images[captions[i][-1]] # re-order images to match new caption order
-        captions[i] = captions[i][:-1]
+    for i in range(len(capsOrdered)):
+        imagesOrdered[i] = images[capsOrdered[i][-1]] # re-order images to match new caption order
+        capsOrdered[i] = capsOrdered[i][:-1]
 
-    return (imagesOrdered, captions)
+    return (imagesOrdered, capsOrdered)
 
 def encode(captions, vocabSize, vocabEncoding):
     """
@@ -59,8 +60,10 @@ def encode(captions, vocabSize, vocabEncoding):
         vocabSize - number of words in vocabulary
         vocabEncoding - mapping from words in vocabulary to integers
     Returns:
-        onehot - PackedSequence object with captions, whose words are represented by one-hot vectors (excludes end tokens)
+        onehot - tensor with captions, whose words are represented by one-hot vectors (excludes end tokens),
+                padded to shape (num_captions, max_caption_length, vocabSize)
         encoded - tensor with caption words represented by integers (excludes start tokens), padded to shape (num_captions, max_caption_length)
+        lengths - lengths (descending) of captions
     """
 
     onehot = torch.zeros(len(captions), len(captions[0]), vocabSize, device=device, dtype=dtype)
@@ -78,13 +81,11 @@ def encode(captions, vocabSize, vocabEncoding):
                 onehot[i][w][vocabEncoding['<unk>']] = 1
                 encoded[i][w] = vocabEncoding['<unk>']
 
-    onehot = torch.nn.utils.rnn.pack_padded_sequence(onehot[:, :-1, :], lengths, batch_first=True)
-
-    return (onehot, encoded[:, 1:].long())
+    return (onehot[:, :-1, :], encoded[:, 1:].long(), lengths)
 
 def prepare_data(images, captions, vocabSize, vocabEncoding):
     """
-    Prepares input (x1, x2) and output (y) data from a batch of images (tensor) and captions (list).
+    Prepares input (x1, x2, lengths) and output (y) data from a batch of images (tensor) and captions (list).
     """
 
     for i in range(len(captions)):
@@ -92,9 +93,9 @@ def prepare_data(images, captions, vocabSize, vocabEncoding):
 
     (x1, captions) = sort_descending_length(images, captions)
 
-    (x2, y) = encode(captions, vocabSize, vocabEncoding)
+    (x2, y, lengths) = encode(captions, vocabSize, vocabEncoding)
 
-    return (x1, x2, y)
+    return (x1, x2, lengths, y)
 
 def evaluate(images, captions, model, dataType, vocab, numTests=50, numCapsPerTest=5):
     """
@@ -124,17 +125,19 @@ def evaluate(images, captions, model, dataType, vocab, numTests=50, numCapsPerTe
 
         for c in range(numCapsPerTest):
             cap = []
-            y_pred = model(imageData[i].unsqueeze(0), startTokenVector)
+            y_pred = model(imageData[i].unsqueeze(0))
             for wordIndex in y_pred:
-                cap.append(vocab[wordIndex]) # decode words with vocab
+                if vocab[wordIndex] not in {'<start>', '<end>', '<unk>', '<num>'}:
+                    cap.append(vocab[wordIndex]) # decode words with vocab
 
             bleuScore = sentence_bleu(captions[i], cap)
             maxBLEU = max(maxBLEU, bleuScore)
 
         bleuTotal += maxBLEU
 
-    print('BLEU Score for %d Images: %f' % (numTests, bleuTotal))
+    print('BLEU-4 Score (%d Images): %f' % (numTests, bleuTotal/numTests))
 
+    return bleuTotal/numTests
 
 class Captioner(torch.nn.Module):
 
@@ -162,47 +165,51 @@ class Captioner(torch.nn.Module):
 
         self.vgg = vgg
         self.linear1 = torch.nn.Linear(4096, 512) # new last layer of CNN
-        self.tanh = torch.nn.Tanh()
-        self.lstm = torch.nn.LSTM(self.vocabSize, 512, batch_first=True)
-        self.linear2 = torch.nn.Linear(512, self.vocabSize)
+        self.linear2 = torch.nn.Linear(self.vocabSize, 512) # produces word embeddings
+        self.lstm = torch.nn.LSTM(512, 512, batch_first=True)
+        self.linear3 = torch.nn.Linear(512, self.vocabSize)
         self.softmax = torch.nn.Softmax(dim=2)
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2=torch.Tensor(), lengths=[]):
         """
         Implements the forward pass of the caption generator.
 
         Arguments:
             x1 - tensor representing image
-            x2 - tensor representing sequence of words in caption, of shape (batch_size, seq_length, num_classes)
+            x2 - tensor representing sequence of words in caption, of shape (batch_size, max_seq_length, num_classes)
         Returns:
             y_pred - (if training) tensor with sequence of probability distributions representing word predictions
                      (otherwise) list of integers corresponding to predicted words
         """
 
-        h_0 = self.tanh(self.linear1(self.vgg(x1)).unsqueeze(0)) # image representation passed to LSTM as initial hidden state
-        c_0 = torch.zeros(h_0.size(), device=device, dtype=dtype)
-
         if self.training:
-            y_pred = self.linear2(torch.nn.utils.rnn.pad_packed_sequence(self.lstm(x2, (h_0, c_0))[0], batch_first=True)[0])
+            x1 = self.linear1(self.vgg(x1))
+            x2 = self.linear2(x2)
+            x2[:, 0, :] = x1 # replace start vectors with image representation
+            x2 = torch.nn.utils.rnn.pack_padded_sequence(x2, lengths, batch_first=True)
+            y_pred = self.linear3(torch.nn.utils.rnn.pad_packed_sequence(self.lstm(x2)[0], batch_first=True)[0])
 
             return torch.transpose(y_pred, 1, 2)
 
         else: # generate caption by sampling (feed generated words back into LSTM until end token reached)
-
-            endTokenVector = torch.zeros(x2.size(), device=device, dtype=dtype)
+            x2 = self.linear1(self.vgg(x1)).unsqueeze(0)
+            endTokenVector = torch.zeros(1, 1, self.vocabSize, device=device, dtype=dtype)
             endTokenVector[0][0][self.endToken] = 1
+            endTokenVector = self.linear2(endTokenVector)
 
             x_t = x2
-            h_t = h_0
+            h_t = torch.zeros(1, 1, 512, device=device, dtype=dtype)
+            c_t = h_t
             y_pred = []
 
-            while not torch.equal(x_t, endTokenVector) and len(y_pred) <= self.maxCapLength:
-                h_t = self.lstm(x_t, (h_t, c_0))[0]
-                x_t = self.softmax(self.linear2(h_t))
+            while not torch.equal(x_t, endTokenVector) and len(y_pred) < self.maxCapLength:
+                (out, (h_t, c_t)) = self.lstm(x_t, (h_t, c_t))
+                x_t = self.softmax(self.linear3(h_t))
 
                 predictedWordIndex = torch.multinomial(x_t[0][0], 1)[0]
                 x_t.new_zeros(x_t.size())
                 x_t[0][0][predictedWordIndex] = 1
+                x_t = self.linear2(x_t)
 
                 y_pred.append(predictedWordIndex)
 
@@ -233,14 +240,15 @@ for p in model.parameters():
         new_params.append(p)
 
 learningRate = 1e-3
-numIters = 10
-numBatches = 300
+numIters = 25
+numBatches = 500
 batchSize = len(images)//numBatches
-valBatchSize = batchSize*len(valImages)//len(images)
-computeValLoss = False
 
-loss_fn = torch.nn.CrossEntropyLoss(size_average=False)
-optimizer = torch.optim.SGD(new_params, lr=learningRate)
+loss_fn = torch.nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(new_params, lr=learningRate)
+trainingLosses = torch.zeros(numIters*numBatches, device=device, dtype=dtype)
+valLosses = torch.zeros(numIters, device=device, dtype=dtype)
+maxBLEU = 0
 
 for t in range(numIters):
     model.train()
@@ -251,28 +259,36 @@ for t in range(numIters):
 
         batchImages = get_image_data('..', trainDataType, images[b*batchSize:(b+1)*batchSize])
         batchCaptions = captions[b*batchSize:(b+1)*batchSize]
-        (x1, x2, y) = prepare_data(batchImages, batchCaptions, vocabSize, vocabEncoding)
+        (x1, x2, lengths, y) = prepare_data(batchImages, batchCaptions, vocabSize, vocabEncoding)
 
-        y_pred = model(x1, x2)
+        y_pred = model(x1, x2, lengths)
         loss = loss_fn(y_pred, y)
-
-        print("(Epoch %d, Batch %d) Training Loss: %f" % (t + 1, b + 1, loss.item()))
+        trainingLosses[t*numBatches+b] = loss
 
         # backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        if computeValLoss:
-            valBatchImages = get_image_data('..', valDataType, valImages[b*valBatchSize:(b+1)*valBatchSize])
-            valBatchCaptions = valCaptions[b*valBatchSize:(b+1)*valBatchSize]
-            (x1_val, x2_val, y_val) = prepare_data(valBatchImages, valBatchCaptions, vocabSize, vocabEncoding)
+    print("Epoch %d Average Training Loss: %f" % (t + 1, torch.mean(trainingLosses[t*numBatches:(t+1)*numBatches]).item()))
 
-            y_pred_val = model(x1_val, x2_val)
-            loss_val = loss_fn(y_pred_val, y_val)
+    with torch.no_grad():
 
-            print("(Epoch %d, Batch %d) Validation Loss: %f" % (t + 1, b + 1, loss_val.item()))
+        valBatchImages = get_image_data('..', valDataType, valImages[0:batchSize])
+        valBatchCaptions = valCaptions[0:batchSize]
+        (x1_val, x2_val, lengths_val, y_val) = prepare_data(valBatchImages, valBatchCaptions, vocabSize, vocabEncoding)
 
-    evaluate(valImages, valCaptions, model, valDataType, vocab)
+        y_pred_val = model(x1_val, x2_val, lengths_val)
+        loss_val = loss_fn(y_pred_val, y_val)
+        valLosses[t] = loss_val
 
+        print("Epoch %d Validation Loss: %f" % (t + 1, loss_val.item()))
 
+        bleu = evaluate(valImages, valCaptions, model, valDataType, vocab)
+
+        if bleu > maxBLEU:
+            maxBLEU = bleu
+            torch.save(model.state_dict(), 'captioner_model.pt')
+
+torch.save(trainingLosses, 'training_loss.pt')
+torch.save(valLosses, 'validation_loss.pt')
