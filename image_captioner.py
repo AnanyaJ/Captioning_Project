@@ -7,7 +7,7 @@ sys.path.insert(0, 'cocoapi-master/PythonAPI/')
 from preprocess import get_images, get_image_data, get_captions, create_encoding
 
 if torch.cuda.is_available():
-    device = torch.device("cuda:0")
+    device = torch.device("cuda")
 else:
     device = torch.device("cpu")
 dtype = torch.float
@@ -71,15 +71,19 @@ def encode(captions, vocabSize, vocabEncoding):
     lengths = []
 
     for i in range(len(captions)):
-        caption = captions[i]
-        lengths.append(len(caption)-1)
-        for w in range(lengths[i]):
-            if caption[w] in vocabEncoding:
-                onehot[i][w][vocabEncoding[caption[w]]] = 1
-                encoded[i][w] = vocabEncoding[caption[w]]
-            else: # unknown word (appears less than 5 times in training data)
-                onehot[i][w][vocabEncoding['<unk>']] = 1
-                encoded[i][w] = vocabEncoding['<unk>']
+        caption = captions[i][:-1]
+        lengths.append(len(caption))
+        for w in range(len(captions[0])):
+            if w < lengths[i]:
+                if caption[w] in vocabEncoding:
+                    onehot[i][w][vocabEncoding[caption[w]]] = 1
+                    encoded[i][w] = vocabEncoding[caption[w]]
+                else: # unknown word (appears less than 5 times in training data)
+                    onehot[i][w][vocabEncoding['<unk>']] = 1
+                    encoded[i][w] = vocabEncoding['<unk>']
+            else:
+                onehot[i][w][vocabEncoding['<end>']] = 1
+                encoded[i][w] = vocabEncoding['<end>']
 
     return (onehot[:, :-1, :], encoded[:, 1:].long(), lengths)
 
@@ -122,11 +126,11 @@ def evaluate(images, captions, model, dataType, vocab, numTests=50, numCapsPerTe
 
     for i in range(numTests):
         maxBLEU = 0 # keep track of only the maximum BLEU score across all generated captions for a particular image
+        y_pred = model(imageData[i].unsqueeze(0), beam=True, k=numCapsPerTest)
 
         for c in range(numCapsPerTest):
             cap = []
-            y_pred = model(imageData[i].unsqueeze(0))
-            for wordIndex in y_pred:
+            for wordIndex in y_pred[c]:
                 if vocab[wordIndex] not in {'<start>', '<end>', '<unk>', '<num>'}:
                     cap.append(vocab[wordIndex]) # decode words with vocab
 
@@ -135,7 +139,7 @@ def evaluate(images, captions, model, dataType, vocab, numTests=50, numCapsPerTe
 
         bleuTotal += maxBLEU
 
-    print('BLEU-4 Score (%d Images): %f' % (numTests, bleuTotal/numTests))
+    print('BLEU-4 Score (%d %s Images): %f' % (numTests, dataType, bleuTotal/numTests))
 
     return bleuTotal/numTests
 
@@ -156,34 +160,38 @@ class Captioner(torch.nn.Module):
         self.vocabSize = vocabSize
         self.maxCapLength = maxCapLength
 
-        vgg = models.vgg16_bn(pretrained=True)
-        newClassifier = torch.nn.Sequential(*list(vgg.classifier.children())[:-1]) # remove last FC layer
-        vgg.classifier = newClassifier
+        resnet = models.resnet152(pretrained=True)
+        resnet = torch.nn.Sequential(*list(resnet.children())[:-1])
 
-        for param in vgg.parameters():  # freeze CNN parameters (except for last layer)
+        for param in resnet.parameters():
             param.requires_grad = False
 
-        self.vgg = vgg
-        self.linear1 = torch.nn.Linear(4096, 512) # new last layer of CNN
-        self.linear2 = torch.nn.Linear(self.vocabSize, 512) # produces word embeddings
-        self.lstm = torch.nn.LSTM(512, 512, batch_first=True)
+        self.resnet = resnet
+        self.linear2 = torch.nn.Linear(self.vocabSize, 2048) # produces word embeddings
+        self.lstm = torch.nn.LSTM(2048, 512, batch_first=True)
         self.linear3 = torch.nn.Linear(512, self.vocabSize)
         self.softmax = torch.nn.Softmax(dim=2)
 
-    def forward(self, x1, x2=torch.Tensor(), lengths=[]):
+    def forward(self, x1, x2=torch.Tensor(), lengths=[], beam=True, k=1):
         """
         Implements the forward pass of the caption generator.
 
         Arguments:
             x1 - tensor representing image
             x2 - tensor representing sequence of words in caption, of shape (batch_size, max_seq_length, num_classes)
+            lengths (if training) - lengths of captions represented by x2
+            beam (if testing) - boolean; if True, beam search is performed when generating captions
+            k (if beam is True) - beam size
         Returns:
             y_pred - (if training) tensor with sequence of probability distributions representing word predictions
-                     (otherwise) list of integers corresponding to predicted words
+                     (if beam search) list of lists of integers corresponding to predicted words for k best captions
+                     (if sampling) list of integers corresponding to predicted words
         """
 
+        self.resnet.eval()
+
         if self.training:
-            x1 = self.linear1(self.vgg(x1))
+            x1 = self.resnet(x1).view(x1.size(0), -1)
             x2 = self.linear2(x2)
             x2[:, 0, :] = x1 # replace start vectors with image representation
             x2 = torch.nn.utils.rnn.pack_padded_sequence(x2, lengths, batch_first=True)
@@ -191,8 +199,7 @@ class Captioner(torch.nn.Module):
 
             return torch.transpose(y_pred, 1, 2)
 
-        else: # generate caption by sampling (feed generated words back into LSTM until end token reached)
-            x2 = self.linear1(self.vgg(x1)).unsqueeze(0)
+        else: # generate caption(s)
             endTokenVector = torch.zeros(1, 1, self.vocabSize, device=device, dtype=dtype)
             endTokenVector[0][0][self.endToken] = 1
             endTokenVector = self.linear2(endTokenVector)
@@ -201,20 +208,59 @@ class Captioner(torch.nn.Module):
             x_t = x2
             h_t = torch.zeros(1, 1, 512, device=device, dtype=dtype)
             c_t = h_t
-            y_pred = []
 
-            while not torch.equal(x_t, endTokenVector) and len(y_pred) < self.maxCapLength:
-                (out, (h_t, c_t)) = self.lstm(x_t, (h_t, c_t))
-                x_t = self.softmax(self.linear3(h_t))
+            if beam: # beam search
 
-                predictedWordIndex = torch.multinomial(x_t[0][0], 1)[0]
-                x_t.new_zeros(x_t.size())
-                x_t[0][0][predictedWordIndex] = 1
-                x_t = self.linear2(x_t)
+                startSeq = {'cap': [x_t], 'prob': 0, 'hidden': h_t, 'memory': c_t, 'y_pred': []}
+                bestSeqs = [startSeq]
+                allSeqs = []
 
-                y_pred.append(predictedWordIndex)
+                for c in range(self.maxCapLength):
+                    for seq in bestSeqs:
+                        if torch.equal(seq['cap'][-1], endTokenVector): # caption completed
+                            allSeqs.append(seq)
+                        else:
+                            (out, (h_t, c_t)) = self.lstm(seq['cap'][-1], (seq['hidden'], seq['memory']))
+                            x_t = self.softmax(self.linear3(h_t))
+                            topK = torch.topk(x_t, k)
+                            topK = (topK[0].squeeze(), topK[1].squeeze())
 
-            return y_pred
+                            for i in range(k):
+                                x_t = torch.zeros(1, 1, self.vocabSize, device=device, dtype=dtype)
+                                x_t[0][0][topK[1][i]] = 1
+                                x_t = self.linear2(x_t)
+
+                                newSeq = {}
+                                newSeq['cap'] = seq['cap'] + [x_t]
+                                newSeq['prob'] = seq['prob'] + topK[0][i]
+                                newSeq['hidden'] = h_t
+                                newSeq['memory'] = c_t
+                                newSeq['y_pred'] = seq['y_pred'] + [topK[1][i]]
+
+                                allSeqs.append(newSeq)
+
+                    bestSeqs = sorted(allSeqs, reverse=True, key=lambda dict:dict['prob'])[:k] # keep k best sequences
+                    allSeqs = []
+
+                return [seq['y_pred'] for seq in bestSeqs]
+
+            else: # sample one caption
+
+                y_pred = []
+
+                while not torch.equal(x_t, endTokenVector) and len(y_pred) < self.maxCapLength:
+                    (out, (h_t, c_t)) = self.lstm(x_t, (h_t, c_t))
+                    x_t = self.softmax(self.linear3(h_t))
+
+                    predictedWordIndex = torch.multinomial(x_t[0][0], 1)[0]
+
+                    x_t.new_zeros(x_t.size())
+                    x_t[0][0][predictedWordIndex] = 1
+                    x_t = self.linear2(x_t)
+
+                    y_pred.append(predictedWordIndex)
+
+                return y_pred
 
 trainDataType = 'train2014'
 valDataType = 'val2014'
@@ -233,20 +279,19 @@ valCaptions = get_captions('cocoapi-master', valDataType, valImages)
 
 model = Captioner(vocabSize, vocabEncoding['<end>'])
 if torch.cuda.is_available():
-    model = model.cuda()
+    model.cuda()
 
 new_params = [] # parameters to be updated
 for p in model.parameters():
     if p.requires_grad: # excludes CNN parameters
         new_params.append(p)
 
-learningRate = 1e-3
 numIters = 25
-numBatches = 500
+numBatches = 350
 batchSize = len(images)//numBatches
 
-loss_fn = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(new_params, lr=learningRate)
+loss_fn = torch.nn.CrossEntropyLoss().cuda()
+optimizer = torch.optim.Adam(new_params)
 trainingLosses = torch.zeros(numIters*numBatches, device=device, dtype=dtype)
 valLosses = torch.zeros(numIters, device=device, dtype=dtype)
 maxBLEU = 0
@@ -269,6 +314,7 @@ for t in range(numIters):
         # backward pass
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(new_params, 1)
         optimizer.step()
 
     print("Epoch %d Average Training Loss: %f" % (t + 1, torch.mean(trainingLosses[t*numBatches:(t+1)*numBatches]).item()))
