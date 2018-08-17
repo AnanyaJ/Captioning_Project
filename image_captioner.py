@@ -197,6 +197,7 @@ class Captioner(torch.nn.Module):
             endTokenVector[0][0][self.endToken] = 1
             endTokenVector = self.linear2(endTokenVector)
 
+            x2 = self.resnet(x1).view(x1.size(0), -1).unsqueeze(0)
             x_t = x2
             h_t = torch.zeros(1, 1, 512, device=device, dtype=dtype)
             c_t = h_t
