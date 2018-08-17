@@ -5,7 +5,7 @@ import torch
 from nltk import word_tokenize
 
 if torch.cuda.is_available():
-    device = torch.device("cuda:0")
+    device = torch.device("cuda")
 else:
     device = torch.device("cpu")
 dtype = torch.float
@@ -56,7 +56,10 @@ def get_image_data(dataDir, dataType, images):
     imgData = torch.zeros(len(images), 3, 224, 224, device=device, dtype=dtype)
 
     for i in range(len(images)):
-        imgData[i] = process(cv2.imread('%s/datasets/mscoco/%s/%s' % (dataDir, dataType, images[i]['file_name']))) # resize image and convert to tensor
+        img = process(cv2.imread('%s/datasets/mscoco/%s/%s' % (dataDir, dataType, images[i]['file_name'])))
+        imgData[i][0] = img[2]
+        imgData[i][1] = img[1]
+        imgData[i][2] = img[0]
 
     return imgData
 
