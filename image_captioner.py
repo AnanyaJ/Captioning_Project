@@ -126,7 +126,7 @@ def evaluate(images, captions, model, dataType, vocab, numTests=50, numCapsPerTe
 
     for i in range(numTests):
         maxBLEU = 0 # keep track of only the maximum BLEU score across all generated captions for a particular image
-        y_pred = model(imageData[i].unsqueeze(0), beam=True, k=numCapsPerTest)
+        y_pred = model(imageData[i].unsqueeze(0), beam=True, k=max(20, numCapsPerTest))
 
         for c in range(numCapsPerTest):
             cap = []
@@ -232,7 +232,7 @@ class Captioner(torch.nn.Module):
 
                                 newSeq = {}
                                 newSeq['cap'] = seq['cap'] + [x_t]
-                                newSeq['prob'] = seq['prob'] + topK[0][i]
+                                newSeq['prob'] = seq['prob'] + torch.log(topK[0][i])
                                 newSeq['hidden'] = h_t
                                 newSeq['memory'] = c_t
                                 newSeq['y_pred'] = seq['y_pred'] + [topK[1][i]]
@@ -286,7 +286,7 @@ for p in model.parameters():
     if p.requires_grad: # excludes CNN parameters
         new_params.append(p)
 
-numIters = 25
+numIters = 15
 numBatches = 350
 batchSize = len(images)//numBatches
 
