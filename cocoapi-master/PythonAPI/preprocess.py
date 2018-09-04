@@ -38,7 +38,7 @@ def get_images(dataDir, dataType):
     imgIds = coco.getImgIds()
     return coco.loadImgs(imgIds)
 
-def get_image_data(dataDir, dataType, images):
+def get_image_data(dataDir, dataType, images, blur=False):
     """
     Returns tensor filled with the data from images, which are first resized, cropped, and normalized.
     """
@@ -56,7 +56,10 @@ def get_image_data(dataDir, dataType, images):
     imgData = torch.zeros(len(images), 3, 224, 224, device=device, dtype=dtype)
 
     for i in range(len(images)):
-        img = process(cv2.imread('%s/datasets/mscoco/%s/%s' % (dataDir, dataType, images[i]['file_name'])))
+        img = cv2.imread('%s/datasets/mscoco/%s/%s' % (dataDir, dataType, images[i]['file_name']))
+        if blur:
+            img = cv2.blur(img, (15, 15))
+        img = process(img)
         imgData[i][0] = img[2]
         imgData[i][1] = img[1]
         imgData[i][2] = img[0]
