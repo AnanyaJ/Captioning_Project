@@ -1,7 +1,9 @@
 import torch
 from torchvision import models
 import random
+import pickle
 from nltk.translate.bleu_score import sentence_bleu
+from nltk.corpus import stopwords
 import sys
 sys.path.insert(0, 'cocoapi-master/PythonAPI/')
 from preprocess import get_images, get_image_data, get_captions, create_encoding
@@ -12,30 +14,30 @@ else:
     device = torch.device("cpu")
 dtype = torch.float
 
-def shuffle(images, captions):
+def shuffle(captions, items):
     """
-    Randomly shuffles items in captions and reorders images according to new caption order.
+    Randomly shuffles captions and reorders items according to new caption order.
 
-    Returns new list of images and captions.
+    Returns new list of items and captions.
     """
 
-    for i in range(len(captions)): # keep track of which image index each caption corresponds to
+    for i in range(len(captions)): # keep track of which item index each caption corresponds to
         captions[i] = (captions[i], i)
 
     random.shuffle(captions)
-    imagesOrdered = []
+    itemsOrdered = []
 
     for i in range(len(captions)):
-        imagesOrdered.append(images[captions[i][1]]) # re-order images to match new caption order
+        itemsOrdered.append(items[captions[i][1]]) # re-order items to match new caption order
         captions[i] = captions[i][0]
 
-    return (imagesOrdered, captions)
+    return (captions, itemsOrdered)
 
-def sort_descending_length(images, captions):
+def sort_descending_length(captions, items):
     """
-    Sorts captions by decreasing length (number of words) and reorders images according to new caption order.
+    Sorts captions by decreasing length (number of words) and reorders items according to new caption order.
 
-    Returns new tensor with image data along with list of sorted captions.
+    Returns list of sorted captions and reordered items.
     """
 
     capsOrdered = []
@@ -43,18 +45,17 @@ def sort_descending_length(images, captions):
         capsOrdered.append(captions[i] + [i])
 
     capsOrdered.sort(reverse=True, key=len) # sort captions by length (descending)
-    imagesOrdered = torch.zeros(images.size(), device=device, dtype=dtype)
+    itemsOrdered = []
 
     for i in range(len(capsOrdered)):
-        imagesOrdered[i] = images[capsOrdered[i][-1]] # re-order images to match new caption order
+        itemsOrdered.append(items[capsOrdered[i][-1]]) # re-order items to match new caption order
         capsOrdered[i] = capsOrdered[i][:-1]
 
-    return (imagesOrdered, capsOrdered)
+    return (capsOrdered, itemsOrdered)
 
 def encode(captions, vocabSize, vocabEncoding):
     """
     Converts captions into tensors based on vocabEncoding.
-
     Arguments:
         captions - list of lists of words, sorted by decreasing length
         vocabSize - number of words in vocabulary
@@ -71,35 +72,45 @@ def encode(captions, vocabSize, vocabEncoding):
     lengths = []
 
     for i in range(len(captions)):
-        caption = captions[i][:-1]
-        lengths.append(len(caption))
-        for w in range(len(captions[0])):
-            if w < lengths[i]:
-                if caption[w] in vocabEncoding:
-                    onehot[i][w][vocabEncoding[caption[w]]] = 1
-                    encoded[i][w] = vocabEncoding[caption[w]]
-                else: # unknown word (appears less than 5 times in training data)
-                    onehot[i][w][vocabEncoding['<unk>']] = 1
-                    encoded[i][w] = vocabEncoding['<unk>']
-            else:
-                onehot[i][w][vocabEncoding['<end>']] = 1
-                encoded[i][w] = vocabEncoding['<end>']
+        caption = captions[i]
+        lengths.append(len(caption) - 1)
+        for w in range(len(caption)):
+            if caption[w] in vocabEncoding:
+                onehot[i][w][vocabEncoding[caption[w]]] = 1
+                encoded[i][w] = vocabEncoding[caption[w]]
+            else:  # unknown word (appears less than 5 times in training data)
+                onehot[i][w][vocabEncoding['<unk>']] = 1
+                encoded[i][w] = vocabEncoding['<unk>']
 
-    return (onehot[:, :-1, :], encoded[:, 1:].long(), lengths)
+    return (onehot, encoded[:, 1:].long(), lengths)
 
-def prepare_data(images, captions, vocabSize, vocabEncoding):
+def prepare_data(images, captions, vocab, vocabEncoding, initialCapWords=None):
     """
     Prepares input (x1, x2, lengths) and output (y) data from a batch of images (tensor) and captions (list).
+    Also produces weights for weighted cross entropy loss.
     """
 
     for i in range(len(captions)):
         captions[i] = random.choice(captions[i])  # randomly choose one caption for each image
 
-    (x1, captions) = sort_descending_length(images, captions)
+    weight = 5
+    if initialCapWords == None:
+        initialCapWords = [set()]*len(images)
+        weight = 1
 
-    (x2, y, lengths) = encode(captions, vocabSize, vocabEncoding)
+    (captions, items) = sort_descending_length(captions, [(images[i], initialCapWords[i]) for i in range(len(images))])
+    initialCapWords = [item[1] for item in items]
+    x1 = torch.zeros(images.size(), device=device, dtype=dtype)
+    for i in range(len(captions)):
+        x1[i] = items[i][0]
 
-    return (x1, x2, lengths, y)
+    (onehotCaps, encodedCaps, lengths) = encode(captions, len(vocab), vocabEncoding)
+    weights = get_weights(encodedCaps, initialCapWords, lengths, weight, vocab)
+
+    x2 = onehotCaps[:, :-1, :]
+    y = onehotCaps[:, 1:]
+
+    return (x1, x2, lengths, y, weights)
 
 def evaluate(images, captions, model, dataType, vocab, numTests=50, numCapsPerTest=5):
     """
@@ -143,6 +154,77 @@ def evaluate(images, captions, model, dataType, vocab, numTests=50, numCapsPerTe
 
     return bleuTotal/numTests
 
+def get_initial_cap_words(images, dataType, initModel, file='', load=False, save=False):
+    """
+    Returns a list of sets, with each set containing the words that appeared in captions generated by initModel for a given image.
+    """
+
+    if load:
+        caps_f = open(file, 'rb')
+        capWords = pickle.load(caps_f)
+        caps_f.close()
+        return capWords
+
+    initModel.eval()
+    capWords = []
+
+    for i in range(len(images)):
+        img = get_image_data('..', dataType, [images[i]], blur=True)[0]
+        y_pred = initModel(img.unsqueeze(0), beam=True, k=20)
+
+        words = set()
+        for c in range(5):
+            words.update(set(y_pred[c]))
+
+        capWords.append(words)
+
+    if save:
+        save_caps = open(file, 'wb')
+        pickle.dump(capWords, save_caps)
+        save_caps.close()
+
+    return capWords
+
+def get_weights(captions, initialCapWords, lengths, weight, vocab):
+    """
+    Generates weights for each word in each caption for weighted cross entropy loss based on whether or not the word was generated by the initial model.
+
+    Arguments:
+        captions - tensor of encoded captions
+        initialCapWords - list of sets, with each set containing the words generated by the initial model for an image
+        lengths - list of lengths for each caption
+        weight - weight assigned to words that don't appear in initialCapWords
+        vocab - list of words in caption vocabulary
+    Returns:
+        weights - tensor of weights with same shape as captions
+    """
+
+    stopWords = set(stopwords.words('english'))
+    weights = torch.zeros(captions.size(), device=device, dtype=dtype)
+
+    for i in range(len(captions)):
+        for w in range(lengths[i]):
+            if captions[i][w].item() in initialCapWords[i] or vocab[captions[i][w]] in stopWords:
+                weights[i][w] = 1
+            else:
+                weights[i][w] = weight
+
+    return weights
+
+def weighted_ce_loss(outputs, labels, weights):
+    """
+    Custom loss function (weighted cross entropy loss).
+    """
+    lsoftmax = torch.nn.LogSoftmax(dim=2)
+
+    batch_size = outputs.size()[0]
+    seq_length = outputs.size()[1]
+    loss = lsoftmax(outputs) * labels
+    loss = torch.sum(loss, dim=2)
+    loss = loss * weights
+
+    return -torch.sum(loss) / batch_size / seq_length
+
 class Captioner(torch.nn.Module):
 
     def __init__(self, vocabSize, endTokenIndex, maxCapLength=20):
@@ -178,7 +260,7 @@ class Captioner(torch.nn.Module):
 
         Arguments:
             x1 - tensor representing image
-            x2 - tensor representing sequence of words in caption, of shape (batch_size, max_seq_length, num_classes)
+            x2 - (if training) tensor representing sequence of words in caption, of shape (batch_size, max_seq_length, num_classes)
             lengths (if training) - lengths of captions represented by x2
             beam (if testing) - boolean; if True, beam search is performed when generating captions
             k (if beam is True) - beam size
@@ -197,7 +279,7 @@ class Captioner(torch.nn.Module):
             x2 = torch.nn.utils.rnn.pack_padded_sequence(x2, lengths, batch_first=True)
             y_pred = self.linear3(torch.nn.utils.rnn.pad_packed_sequence(self.lstm(x2)[0], batch_first=True)[0])
 
-            return torch.transpose(y_pred, 1, 2)
+            return y_pred
 
         else: # generate caption(s)
             endTokenVector = torch.zeros(1, 1, self.vocabSize, device=device, dtype=dtype)
@@ -235,7 +317,7 @@ class Captioner(torch.nn.Module):
                                 newSeq['prob'] = seq['prob'] + torch.log(topK[0][i])
                                 newSeq['hidden'] = h_t
                                 newSeq['memory'] = c_t
-                                newSeq['y_pred'] = seq['y_pred'] + [topK[1][i]]
+                                newSeq['y_pred'] = seq['y_pred'] + [topK[1][i].item()]
 
                                 allSeqs.append(newSeq)
 
@@ -258,7 +340,7 @@ class Captioner(torch.nn.Module):
                     x_t[0][0][predictedWordIndex] = 1
                     x_t = self.linear2(x_t)
 
-                    y_pred.append(predictedWordIndex)
+                    y_pred.append(predictedWordIndex.item())
 
                 return y_pred
 
@@ -277,20 +359,24 @@ captions = get_captions('cocoapi-master', trainDataType, images)
 vocabSize = len(vocab)
 valCaptions = get_captions('cocoapi-master', valDataType, valImages)
 
+initModel = Captioner(vocabSize, vocabEncoding['<end>'])
+initModel.load_state_dict(torch.load('initial_captioner.pt'))
 model = Captioner(vocabSize, vocabEncoding['<end>'])
 if torch.cuda.is_available():
+    initModel.cuda()
     model.cuda()
+
+initialCaps = get_initial_cap_words(images, trainDataType, initModel, file='blurred_image_caps.pickle', load=True) # caption words generated from blurred images
 
 new_params = [] # parameters to be updated
 for p in model.parameters():
     if p.requires_grad: # excludes CNN parameters
         new_params.append(p)
 
-numIters = 15
+numIters = 25
 numBatches = 350
 batchSize = len(images)//numBatches
 
-loss_fn = torch.nn.CrossEntropyLoss().cuda()
 optimizer = torch.optim.Adam(new_params)
 trainingLosses = torch.zeros(numIters*numBatches, device=device, dtype=dtype)
 valLosses = torch.zeros(numIters, device=device, dtype=dtype)
@@ -298,17 +384,20 @@ maxBLEU = 0
 
 for t in range(numIters):
     model.train()
-    (images, captions) = shuffle(images, captions)
-    (valImages, valCaptions) = shuffle(valImages, valCaptions)
+    (captions, items) = shuffle(captions, [(images[i], initialCaps[i]) for i in range(len(images))])
+    images = [item[0] for item in items]
+    initialCaps = [item[1] for item in items]
+    (valCaptions, valImages) = shuffle(valCaptions, valImages)
 
     for b in range(numBatches):
 
         batchImages = get_image_data('..', trainDataType, images[b*batchSize:(b+1)*batchSize])
         batchCaptions = captions[b*batchSize:(b+1)*batchSize]
-        (x1, x2, lengths, y) = prepare_data(batchImages, batchCaptions, vocabSize, vocabEncoding)
+        initialCapWords = initialCaps[b*batchSize:(b+1)*batchSize]
+        (x1, x2, lengths, y, weights) = prepare_data(batchImages, batchCaptions, vocab, vocabEncoding)
 
         y_pred = model(x1, x2, lengths)
-        loss = loss_fn(y_pred, y)
+        loss = weighted_ce_loss(y_pred, y, weights)
         trainingLosses[t*numBatches+b] = loss
 
         # backward pass
@@ -323,19 +412,19 @@ for t in range(numIters):
 
         valBatchImages = get_image_data('..', valDataType, valImages[0:batchSize])
         valBatchCaptions = valCaptions[0:batchSize]
-        (x1_val, x2_val, lengths_val, y_val) = prepare_data(valBatchImages, valBatchCaptions, vocabSize, vocabEncoding)
+        (x1_val, x2_val, lengths_val, y_val, weights) = prepare_data(valBatchImages, valBatchCaptions, vocab, vocabEncoding)
 
         y_pred_val = model(x1_val, x2_val, lengths_val)
-        loss_val = loss_fn(y_pred_val, y_val)
+        loss_val = weighted_ce_loss(y_pred_val, y_val, weights)
         valLosses[t] = loss_val
 
         print("Epoch %d Validation Loss: %f" % (t + 1, loss_val.item()))
 
-        bleu = evaluate(valImages, valCaptions, model, valDataType, vocab)
+        bleu = evaluate(valImages, valCaptions, model, valDataType, vocab, numTests=max(100, batchSize))
 
         if bleu > maxBLEU:
             maxBLEU = bleu
-            torch.save(model.state_dict(), 'captioner_model.pt')
+            torch.save(model.state_dict(), 'new_captioner_model.pt')
 
 torch.save(trainingLosses, 'training_loss.pt')
 torch.save(valLosses, 'validation_loss.pt')
